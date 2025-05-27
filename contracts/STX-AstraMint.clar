@@ -116,3 +116,155 @@
         (var-set last-event-id (+ (var-get last-event-id) u1))
         (print { type: "burn", id: (var-get last-event-id), from: from, amount: amount })))
 
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;; Read-Only Functions ;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(define-read-only (get-name)
+    (ok (var-get token-name)))
+
+(define-read-only (get-symbol)
+    (ok (var-get token-symbol)))
+
+(define-read-only (get-decimals)
+    (ok (var-get token-decimals)))
+
+(define-read-only (get-total-supply)
+    (ok (var-get total-supply)))
+
+(define-read-only (get-balance (account principal))
+    (ok (ft-get-balance stellar account)))
+
+(define-read-only (get-allowance (owner principal) (spender principal))
+    (match (map-get? allowances { owner: owner, spender: spender })
+        allowance-data (let ((current-height stacks-block-height))
+            (if (>= current-height (get expiry allowance-data))
+                (ok u0)
+                (ok (get amount allowance-data))))
+        (ok u0)))
+
+(define-read-only (is-locked (address principal))
+    (match (map-get? locked-tokens { address: address })
+        lock-data (> (get unlock-height lock-data) stacks-block-height)
+        false))
+
+
+
+;;;;; PUBLIC FUNCTIONS ;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Administrative Functions
+(define-public (initialize (name (string-ascii 32)) (symbol (string-ascii 10)) (decimals uint))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (var-get initialized)) ERR-ALREADY-INITIALIZED)
+
+        ;; Validate name
+        (asserts! (>= (len name) u1) ERR-INVALID-AMOUNT)  ;; Ensure name is not empty
+        (asserts! (<= (len name) u32) ERR-INVALID-AMOUNT)  ;; Extra safety check for length
+
+        ;; Validate symbol
+        (asserts! (>= (len symbol) u1) ERR-INVALID-AMOUNT)  ;; Ensure symbol is not empty
+        (asserts! (<= (len symbol) u10) ERR-INVALID-AMOUNT)  ;; Extra safety check for length
+
+        ;; Validate decimals (common values are 6, 8, or 18)
+        (asserts! (<= decimals u18) ERR-INVALID-AMOUNT)  ;; Ensure decimals is reasonable
+        (asserts! (>= decimals u0) ERR-INVALID-AMOUNT)   ;; Ensure decimals is non-negative
+
+        ;; After validation, set the values
+        (var-set token-name name)
+        (var-set token-symbol symbol)
+        (var-set token-decimals decimals)
+        (var-set initialized true)
+        (ok true)))
+
+
+(define-public (set-contract-owner (new-owner principal))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq new-owner (var-get contract-owner))) ERR-INVALID-RECIPIENT)
+        (var-set contract-owner new-owner)
+        (ok true)))
+
+(define-public (pause)
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (var-set paused true)
+        (ok true)))
+
+(define-public (unpause)
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (var-set paused false)
+        (ok true)))
+
+;; Token Operations
+(define-public (mint (amount uint) (recipient principal))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-valid-recipient recipient) ERR-INVALID-RECIPIENT)
+        (try! (check-initialized))
+        (try! (check-not-paused))
+
+        (let ((new-supply (try! (safe-add (var-get total-supply) amount))))
+            (asserts! (<= new-supply MAX-SUPPLY) ERR-MAX-SUPPLY-REACHED)
+
+            (try! (ft-mint? stellar amount recipient))
+            (var-set total-supply new-supply)
+
+            (map-set governance-tokens
+                { holder: recipient }
+                { 
+                    voting-power: (unwrap! (safe-add 
+                        (default-to u0 (get voting-power (map-get? governance-tokens { holder: recipient }))) 
+                        amount) ERR-OVERFLOW),
+                    last-vote-height: stacks-block-height 
+                })
+            (ok true))))
+
+(define-public (transfer (amount uint) (recipient principal))
+    (begin
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-valid-recipient recipient) ERR-INVALID-RECIPIENT)
+        (try! (check-initialized))
+        (try! (check-not-paused))
+        (asserts! (not (is-locked tx-sender)) ERR-NOT-AUTHORIZED)
+
+        (let ((sender-balance (unwrap! (get-balance tx-sender) ERR-INSUFFICIENT-BALANCE)))
+            (asserts! (>= sender-balance amount) ERR-INSUFFICIENT-BALANCE)
+
+            (try! (ft-transfer? stellar amount tx-sender recipient))
+
+            (map-set governance-tokens
+                { holder: tx-sender }
+                { 
+                    voting-power: (- sender-balance amount),
+                    last-vote-height: stacks-block-height 
+                })
+
+            (map-set governance-tokens
+                { holder: recipient }
+                { 
+                    voting-power: (unwrap! (safe-add 
+                        (default-to u0 (get voting-power (map-get? governance-tokens { holder: recipient }))) 
+                        amount) ERR-OVERFLOW),
+                    last-vote-height: stacks-block-height 
+                })
+            (ok true))))
+
+(define-public (approve (amount uint) (spender principal) (expiry uint))
+    (begin
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (not (is-eq spender tx-sender)) ERR-INVALID-SPENDER)
+        (asserts! (>= expiry stacks-block-height) ERR-EXPIRED-ALLOWANCE)
+        (try! (check-initialized))
+        (try! (check-not-paused))
+
+        (map-set allowances
+            { owner: tx-sender, spender: spender }
+            { amount: amount, expiry: expiry })
+        (ok true)))
